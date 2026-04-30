@@ -34,11 +34,12 @@ Install ffmpeg (if not already):
 ```bash
 # Ubuntu/Debian
 sudo apt install ffmpeg
-
+# Arch Linux
+sudo pacman -S ffmpeg
 # macOS (Homebrew)
 brew install ffmpeg
-
 # Windows — download from https://ffmpeg.org/download.html
+```
 ```
 
 ---
