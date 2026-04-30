@@ -1,5 +1,4 @@
 # 🎭 KdenLoquist — Audio-Synced Talking Tool for Kdenlive
-
 > A ProLoquist Volume 2-style ventriloquist/talking-photo effect tool,
 > built specifically for Kdenlive users.
 
@@ -26,11 +25,21 @@ Kdenlive timeline.
 | **ffmpeg**  | any recent (must be in PATH) |
 
 Install Python packages:
+
 ```bash
 pip install -r requirements.txt
 ```
 
+> **Arch Linux / Debian users:** If you get a tkinter import error, install Tk separately:
+> ```bash
+> # Arch Linux
+> sudo pacman -S tk
+> # Ubuntu/Debian
+> sudo apt install python3-tk
+> ```
+
 Install ffmpeg (if not already):
+
 ```bash
 # Ubuntu/Debian
 sudo apt install ffmpeg
@@ -40,7 +49,19 @@ sudo pacman -S ffmpeg
 brew install ffmpeg
 # Windows — download from https://ffmpeg.org/download.html
 ```
+
+### Arch Linux — virtual environment setup
+
+Arch protects its system Python, so use a virtual environment:
+
+```bash
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+python kdenloquist.py
 ```
+
+Run `source venv/bin/activate` each time you open a new terminal before launching the script.
 
 ---
 
