@@ -2,8 +2,8 @@
 """
 ============================================================
   KdenLoquist - Audio-Synced Puppet Tool for Kdenlive
-  Simplified exclusive "Puppet" Mode (Jaw-Drop)
-  Now with Drag-and-Drop Support!
+  True "Cardboard Cutout" Mode (No Blur, Exact Masking)
+  Drag-and-Drop Supported
 ============================================================
 """
 
@@ -43,8 +43,8 @@ BTN_HOV  = "#2a2a42"
 RED      = "#ff4f6a"
 YELLOW   = "#f5c542"
 
-SNAP_DIST   = 14   # canvas pixels: clicking within this of pt[0] auto-closes
-POINT_R     = 5    # radius of drawn control points
+SNAP_DIST   = 14   
+POINT_R     = 5    
 
 
 # ══════════════════════════════════════════════════════════
@@ -173,59 +173,56 @@ def _poly_mask(points, h, w) -> np.ndarray:
 
 
 def render_frame_puppet(base_rgba: np.ndarray, points: list,
-                        amplitude: float, softness: float,
-                        inner_color: tuple,
-                        jaw_drop_pct: float = 0.55,
-                        hinge_pct:    float = 0.40) -> np.ndarray:
+                        amplitude: float, inner_color: tuple,
+                        jaw_drop_pct: float = 0.55) -> np.ndarray:
+    """
+    True Cutout Logic: The exact polygon drawn is shifted down.
+    The gap left behind is filled with the inner color.
+    """
     result = base_rgba.copy()
     if not points or len(points) < 3 or amplitude <= 0.001:
         return result
 
     h_img, w_img = result.shape[:2]
+    
+    # Get bounding box of the drawn polygon to calculate the drop relative to its height
     pts_np = np.array(points, dtype=np.int32)
-    x1, y1 = pts_np.min(axis=0)
-    x2, y2 = pts_np.max(axis=0)
+    y1 = pts_np[:, 1].min()
+    y2 = pts_np[:, 1].max()
     mh = max(y2 - y1, 1)
 
-    hinge_y  = int(y1 + mh * hinge_pct)
     max_drop = int(mh * jaw_drop_pct)
     drop     = int(max_drop * amplitude)
     if drop < 1:
         return result
 
     ir, ig, ib = inner_color
-    full_mask   = _poly_mask(points, h_img, w_img)
-    upper_mask  = full_mask.copy(); upper_mask[hinge_y:, :] = 0
-    lower_mask  = full_mask.copy(); lower_mask[:hinge_y, :] = 0
+    full_mask  = _poly_mask(points, h_img, w_img)
 
-    inner_arr      = np.empty_like(base_rgba)
+    # 1. Fill the original polygon area with the dark inner mouth color
+    inner_arr = np.empty_like(base_rgba)
     inner_arr[:,:] = [ir, ig, ib, 255]
-    m_f  = full_mask[:, :, np.newaxis].astype(np.float32) / 255.0
-    result = (base_rgba.astype(np.float32) * (1.0 - m_f) + inner_arr.astype(np.float32) * m_f).clip(0, 255).astype(np.uint8)
+    m_f = full_mask[:, :, np.newaxis].astype(np.float32) / 255.0
+    
+    result = (base_rgba.astype(np.float32) * (1.0 - m_f) + 
+              inner_arr.astype(np.float32) * m_f).astype(np.uint8)
 
-    m_u  = upper_mask[:, :, np.newaxis].astype(np.float32) / 255.0
-    result = (result.astype(np.float32) * (1.0 - m_u) + base_rgba.astype(np.float32) * m_u).clip(0, 255).astype(np.uint8)
+    # 2. Extract the jaw pixels (the exact pixels inside the drawn mask)
+    jaw_pixels = base_rgba.copy()
 
+    # 3. Shift both the mask and the jaw pixels downward
     if drop < h_img:
-        shifted_lower = np.zeros((h_img, w_img), dtype=np.uint8)
-        shifted_lower[drop:, :] = lower_mask[:h_img - drop, :]
-        jaw_pixels = np.zeros_like(base_rgba)
-        jaw_pixels[drop:, :] = base_rgba[:h_img - drop, :]
-        m_l = shifted_lower[:, :, np.newaxis].astype(np.float32) / 255.0
-        result = (result.astype(np.float32) * (1.0 - m_l) + jaw_pixels.astype(np.float32) * m_l).clip(0, 255).astype(np.uint8)
-
-    if softness > 0:
-        k      = max(3, int(softness) * 2 + 1) | 1
-        margin = k
-        sig    = softness * 0.4
-        def blur_hband(ya, yb):
-            ya = max(0, ya); yb = min(h_img, yb)
-            xa = max(0, x1 - margin); xb = min(w_img, x2 + margin)
-            if yb > ya and xb > xa:
-                band = result[ya:yb, xa:xb].astype(np.float32)
-                result[ya:yb, xa:xb] = cv2.GaussianBlur(band, (k, k), sig).astype(np.uint8)
-        blur_hband(hinge_y - margin, hinge_y + margin)
-        blur_hband(hinge_y + drop - margin, hinge_y + drop + margin)
+        shifted_mask = np.zeros_like(full_mask)
+        shifted_mask[drop:, :] = full_mask[:h_img - drop, :]
+        
+        shifted_jaw = np.zeros_like(base_rgba)
+        shifted_jaw[drop:, :] = jaw_pixels[:h_img - drop, :]
+        
+        m_s = shifted_mask[:, :, np.newaxis].astype(np.float32) / 255.0
+        
+        # 4. Paste the shifted jaw OVER the result (overlapping whatever is below it)
+        result = (result.astype(np.float32) * (1.0 - m_s) + 
+                  shifted_jaw.astype(np.float32) * m_s).astype(np.uint8)
 
     result[:, :, 3] = base_rgba[:, :, 3]
     return result
@@ -236,7 +233,7 @@ def render_frame_puppet(base_rgba: np.ndarray, points: list,
 # ══════════════════════════════════════════════════════════
 
 class KdenLoquist:
-    APP_TITLE = "KdenLoquist - Audio-Synced Puppet Tool for Kdenlive"
+    APP_TITLE = "KdenLoquist - True Cardboard Cutout Tool"
 
     def __init__(self, root):
         self.root = root
@@ -245,7 +242,6 @@ class KdenLoquist:
         self.root.minsize(900, 600)
         self.root.configure(bg=BG)
 
-        # Drag and Drop binding
         if DND_SUPPORTED:
             self.root.drop_target_register(DND_FILES)
             self.root.dnd_bind('<<Drop>>', self._on_file_drop)
@@ -276,13 +272,11 @@ class KdenLoquist:
         self.v_anim      = tk.DoubleVar(value=0.65)
         self.v_smooth    = tk.DoubleVar(value=0.15) 
         self.v_jaw_drop  = tk.DoubleVar(value=0.55)
-        self.v_hinge     = tk.DoubleVar(value=0.40)
         self.v_power     = tk.DoubleVar(value=1.5)
         self.v_threshold = tk.DoubleVar(value=0.05)
         self.v_flo       = tk.DoubleVar(value=80.0)
         self.v_fhi       = tk.DoubleVar(value=3500.0)
         self.v_offset    = tk.IntVar(value=0)
-        self.v_soft      = tk.DoubleVar(value=5.0)
         self.v_fps       = tk.IntVar(value=24)
         self.v_crf       = tk.IntVar(value=20)
         self.v_mouth_color = tk.StringVar(value="#1a0008")
@@ -297,7 +291,6 @@ class KdenLoquist:
     # ──────────────────────────────────────────────────────
     
     def _on_file_drop(self, event):
-        # TkinterDnD passes file paths. Paths with spaces are sometimes wrapped in {}
         file_path = event.data
         if file_path.startswith('{') and file_path.endswith('}'):
             file_path = file_path[1:-1]
@@ -312,7 +305,6 @@ class KdenLoquist:
             self._process_audio(file_path)
         else:
             messagebox.showwarning("Unsupported File", f"Cannot load file type: {ext}")
-
 
     # ──────────────────────────────────────────────────────
     #  UI construction
@@ -329,7 +321,7 @@ class KdenLoquist:
     def _build_toolbar(self):
         tb = tk.Frame(self.root, bg=ACCENT2, height=42)
         tb.pack(fill=tk.X); tb.pack_propagate(False)
-        tk.Label(tb, text="  🎭  KdenLoquist Puppet", bg=ACCENT2, fg=FG,
+        tk.Label(tb, text="  🎭  KdenLoquist Cutout", bg=ACCENT2, fg=FG,
                  font=("Segoe UI", 12, "bold")).pack(side=tk.LEFT, padx=6)
         
         dnd_text = "Drag & Drop Supported!" if DND_SUPPORTED else "Install tkinterdnd2 for Drag & Drop"
@@ -368,8 +360,8 @@ class KdenLoquist:
 
         # Mouth Mask
         s2 = Section(p, "🖊  Mouth Mask"); s2.pack(**pad); b2 = s2.body
-        tk.Label(b2, text="Click to place points around the mouth.\nDouble-click or click near ● to close.\nRight-click or Z to undo last point.",
-                 bg=PANEL_BG, fg=FG_DIM, font=("Segoe UI", 8), justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 4))
+        tk.Label(b2, text="Draw ONLY the piece that drops (the lower jaw).\nThe top edge of your drawing is the hinge.",
+                 bg=PANEL_BG, fg=FG_DIM, font=("Segoe UI", 8, "bold"), justify=tk.LEFT, wraplength=230).pack(anchor=tk.W, pady=(0, 4))
         btn_row = tk.Frame(b2, bg=PANEL_BG); btn_row.pack(fill=tk.X, pady=2)
         StyledButton(btn_row, "✓ Close",  command=self._close_mask).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0,2))
         StyledButton(btn_row, "↩ Undo",   command=self._undo_point).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2,2))
@@ -380,8 +372,7 @@ class KdenLoquist:
         # Animation
         s3 = Section(p, "🎬  Puppet Physics"); s3.pack(**pad); b3 = s3.body
         LabeledSlider(b3, "Animation Amount", self.v_anim,  0.05, 1.5).pack(fill=tk.X, pady=2)
-        LabeledSlider(b3, "Jaw Drop Amount", self.v_jaw_drop, 0.1, 1.0).pack(fill=tk.X, pady=2)
-        LabeledSlider(b3, "Hinge Position",  self.v_hinge,   0.0, 1.0, fmt="{:.3f}").pack(fill=tk.X, pady=2)
+        LabeledSlider(b3, "Jaw Drop (Cutout Width)", self.v_jaw_drop, 0.1, 1.0).pack(fill=tk.X, pady=2)
         
         tk.Label(b3, text="- Dynamics -", bg=PANEL_BG, fg=FG_DIM, font=("Segoe UI", 8, "italic")).pack(pady=2)
         LabeledSlider(b3, "Response (Snappiness)", self.v_power, 0.5, 3.0, fmt="{:.2f}").pack(fill=tk.X, pady=2)
@@ -391,7 +382,6 @@ class KdenLoquist:
         tk.Label(b3, text="- Audio & Polish -", bg=PANEL_BG, fg=FG_DIM, font=("Segoe UI", 8, "italic")).pack(pady=2)
         LabeledSlider(b3, "Freq Low (Hz)",  self.v_flo, 20,  1000, fmt="{:.0f} Hz").pack(fill=tk.X, pady=2)
         LabeledSlider(b3, "Freq High (Hz)", self.v_fhi, 500, 8000, fmt="{:.0f} Hz").pack(fill=tk.X, pady=2)
-        LabeledSlider(b3, "Edge Softness",  self.v_soft, 0,  20,   fmt="{:.1f}").pack(fill=tk.X, pady=2)
 
         of_row = tk.Frame(b3, bg=PANEL_BG); of_row.pack(fill=tk.X, pady=2)
         tk.Label(of_row, text="Audio Offset (frames)", bg=PANEL_BG, fg=FG_DIM, font=("Segoe UI", 8)).pack(side=tk.LEFT)
@@ -425,7 +415,7 @@ class KdenLoquist:
     def _build_canvas(self, parent):
         frame = tk.Frame(parent, bg=BG)
         frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=2, pady=2)
-        tk.Label(frame, text="← Load an image, then click to place mouth mask points", bg=BG, fg=FG_DIM, font=("Segoe UI", 9)).pack(anchor=tk.W, padx=6, pady=(4, 0))
+        tk.Label(frame, text="← Load an image, then trace ONLY the piece that will drop (e.g. the chin).", bg=BG, fg=FG_DIM, font=("Segoe UI", 9)).pack(anchor=tk.W, padx=6, pady=(4, 0))
         self._canvas = tk.Canvas(frame, bg="#090912", highlightthickness=1, highlightbackground=ACCENT2, cursor="crosshair")
         self._canvas.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
@@ -624,18 +614,6 @@ class KdenLoquist:
         if self.mask_closed and len(cpts) >= 2:
             self._canvas.create_line(*cpts[-1], *cpts[0], fill=ACCENT, width=2)
 
-        if self.mask_closed and len(pts) >= 3:
-            pts_np = np.array(pts)
-            x1, y1 = pts_np.min(axis=0)
-            x2, y2 = pts_np.max(axis=0)
-            mh     = max(y2 - y1, 1)
-            hy_img = int(y1 + mh * self.v_hinge.get())
-            _, hcy = self._img_to_canvas(0, hy_img)
-            hcx1, _ = self._img_to_canvas(x1, 0)
-            hcx2, _ = self._img_to_canvas(x2, 0)
-            self._canvas.create_line(hcx1, hcy, hcx2, hcy, fill=YELLOW, width=1, dash=(5, 3))
-            self._canvas.create_text((hcx1 + hcx2) / 2, hcy - 8, text="- hinge -", fill=YELLOW, font=("Segoe UI", 7))
-
         for i, (cx, cy) in enumerate(cpts):
             is_first = (i == 0)
             fill  = YELLOW if is_first else ACCENT
@@ -667,10 +645,8 @@ class KdenLoquist:
             return self.base_rgba.copy()
         inner = self._hex_to_rgb(self.v_mouth_color.get())
         return render_frame_puppet(
-            self.base_rgba, self.mask_points, amplitude,
-            self.v_soft.get(), inner,
-            jaw_drop_pct=self.v_jaw_drop.get(),
-            hinge_pct=self.v_hinge.get()
+            self.base_rgba, self.mask_points, amplitude, inner,
+            jaw_drop_pct=self.v_jaw_drop.get()
         )
 
     def _preview_frame(self):
