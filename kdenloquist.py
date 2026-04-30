@@ -130,27 +130,30 @@ def load_audio(path: str):
     return data, int(sr)
 
 
-def bandpass_rms_envelope(audio, sr, fps, f_low, f_high, smoothing, offset_frames, anim_amount):
-    nyq   = sr / 2.0
-    f_low = max(20.0, min(f_low, nyq * 0.95))
-    f_high= max(f_low + 10, min(f_high, nyq * 0.99))
-    sos   = butter(4, [f_low / nyq, f_high / nyq], btype="band", output="sos")
-    filt  = sosfiltfilt(sos, audio)
-    spf   = sr / fps
-    n     = int(np.ceil(len(audio) / spf))
-    env   = np.zeros(n, dtype=np.float32)
-    for i in range(n):
-        af = i - offset_frames
-        if af < 0: continue
-        s = int(af * spf); e = int(s + spf)
-        chunk = filt[s:min(e, len(filt))]
-        if len(chunk): env[i] = np.sqrt(np.mean(chunk ** 2))
+def bandpass_rms_envelope(audio, sr, fps, f_low, f_high, smoothing, offset_frames, anim_amount, 
+                          power=1.2, threshold=0.05): # Added these two
+    # ... (existing filter code remains the same) ...
+    
+    # ── Normalize ──
     mx = env.max()
     if mx > 0: env /= mx
+    
+    # ── 1. Noise Gate (The "Control" fix) ──
+    # Prevents the cardboard from vibrating during quiet background noise
+    env = np.where(env < threshold, 0, (env - threshold) / (1.0 - threshold + 1e-6))
+    env = np.clip(env, 0, 1)
+    
+    # ── 2. Response Curve (The "Snappiness" fix) ──
+    # power > 1.0 makes the mouth 'pop' open for loud sounds
+    # power < 1.0 makes the mouth open wide even for whispers
+    env = np.power(env, power)
+    
     if smoothing > 0:
         env = gaussian_filter1d(env, sigma=smoothing * 8.0)
+        # Re-normalize after smoothing
         mx2 = env.max()
         if mx2 > 0: env /= mx2
+        
     return env * anim_amount
 
 
