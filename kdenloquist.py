@@ -3,6 +3,7 @@
 ============================================================
   KdenLoquist - Audio-Synced Puppet Tool for Kdenlive
   Simplified exclusive "Puppet" Mode (Jaw-Drop)
+  Now with Drag-and-Drop Support!
 ============================================================
 """
 
@@ -19,6 +20,13 @@ import tempfile
 from scipy.io import wavfile
 from scipy.signal import butter, sosfiltfilt
 from scipy.ndimage import gaussian_filter1d
+
+# Try to import Drag-and-Drop support
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    DND_SUPPORTED = True
+except ImportError:
+    DND_SUPPORTED = False
 
 
 # ══════════════════════════════════════════════════════════
@@ -103,7 +111,7 @@ def decode_audio_to_wav(src_path: str) -> str:
     return tmp.name
 
 
-def load_audio(path: str):
+def load_audio_file(path: str):
     wav_path = path
     tmp_created = False
     if not path.lower().endswith(".wav"):
@@ -141,11 +149,8 @@ def bandpass_rms_envelope(audio, sr, fps, f_low, f_high, smoothing, offset_frame
     mx = env.max()
     if mx > 0: env /= mx
     
-    # Noise Gate
     env = np.where(env < threshold, 0, (env - threshold) / (1.0 - threshold + 1e-6))
     env = np.clip(env, 0, 1)
-    
-    # Response Curve
     env = np.power(env, power)
     
     if smoothing > 0:
@@ -189,45 +194,36 @@ def render_frame_puppet(base_rgba: np.ndarray, points: list,
         return result
 
     ir, ig, ib = inner_color
-
     full_mask   = _poly_mask(points, h_img, w_img)
-    upper_mask  = full_mask.copy()
-    upper_mask[hinge_y:, :] = 0
-    lower_mask  = full_mask.copy()
-    lower_mask[:hinge_y, :] = 0
+    upper_mask  = full_mask.copy(); upper_mask[hinge_y:, :] = 0
+    lower_mask  = full_mask.copy(); lower_mask[:hinge_y, :] = 0
 
     inner_arr      = np.empty_like(base_rgba)
     inner_arr[:,:] = [ir, ig, ib, 255]
     m_f  = full_mask[:, :, np.newaxis].astype(np.float32) / 255.0
-    result = (base_rgba.astype(np.float32) * (1.0 - m_f) +
-              inner_arr.astype(np.float32) * m_f).clip(0, 255).astype(np.uint8)
+    result = (base_rgba.astype(np.float32) * (1.0 - m_f) + inner_arr.astype(np.float32) * m_f).clip(0, 255).astype(np.uint8)
 
     m_u  = upper_mask[:, :, np.newaxis].astype(np.float32) / 255.0
-    result = (result.astype(np.float32) * (1.0 - m_u) +
-              base_rgba.astype(np.float32) * m_u).clip(0, 255).astype(np.uint8)
+    result = (result.astype(np.float32) * (1.0 - m_u) + base_rgba.astype(np.float32) * m_u).clip(0, 255).astype(np.uint8)
 
     if drop < h_img:
         shifted_lower = np.zeros((h_img, w_img), dtype=np.uint8)
         shifted_lower[drop:, :] = lower_mask[:h_img - drop, :]
         jaw_pixels = np.zeros_like(base_rgba)
         jaw_pixels[drop:, :] = base_rgba[:h_img - drop, :]
-
         m_l = shifted_lower[:, :, np.newaxis].astype(np.float32) / 255.0
-        result = (result.astype(np.float32) * (1.0 - m_l) +
-                  jaw_pixels.astype(np.float32) * m_l).clip(0, 255).astype(np.uint8)
+        result = (result.astype(np.float32) * (1.0 - m_l) + jaw_pixels.astype(np.float32) * m_l).clip(0, 255).astype(np.uint8)
 
     if softness > 0:
         k      = max(3, int(softness) * 2 + 1) | 1
         margin = k
         sig    = softness * 0.4
-
         def blur_hband(ya, yb):
             ya = max(0, ya); yb = min(h_img, yb)
             xa = max(0, x1 - margin); xb = min(w_img, x2 + margin)
             if yb > ya and xb > xa:
                 band = result[ya:yb, xa:xb].astype(np.float32)
                 result[ya:yb, xa:xb] = cv2.GaussianBlur(band, (k, k), sig).astype(np.uint8)
-
         blur_hband(hinge_y - margin, hinge_y + margin)
         blur_hband(hinge_y + drop - margin, hinge_y + drop + margin)
 
@@ -242,12 +238,17 @@ def render_frame_puppet(base_rgba: np.ndarray, points: list,
 class KdenLoquist:
     APP_TITLE = "KdenLoquist - Audio-Synced Puppet Tool for Kdenlive"
 
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root):
         self.root = root
         self.root.title(self.APP_TITLE)
         self.root.geometry("1280x780")
         self.root.minsize(900, 600)
         self.root.configure(bg=BG)
+
+        # Drag and Drop binding
+        if DND_SUPPORTED:
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind('<<Drop>>', self._on_file_drop)
 
         self.image          = None
         self.image_path     = None
@@ -272,9 +273,8 @@ class KdenLoquist:
         self._export_thread = None
         self._cancel_export = False
         
-        # UI Control Variables
         self.v_anim      = tk.DoubleVar(value=0.65)
-        self.v_smooth    = tk.DoubleVar(value=0.15)
+        self.v_smooth    = tk.DoubleVar(value=0.15) 
         self.v_jaw_drop  = tk.DoubleVar(value=0.55)
         self.v_hinge     = tk.DoubleVar(value=0.40)
         self.v_power     = tk.DoubleVar(value=1.5)
@@ -293,6 +293,28 @@ class KdenLoquist:
         self.root.bind("<Z>", lambda e: self._undo_point())
 
     # ──────────────────────────────────────────────────────
+    #  Drag and Drop logic
+    # ──────────────────────────────────────────────────────
+    
+    def _on_file_drop(self, event):
+        # TkinterDnD passes file paths. Paths with spaces are sometimes wrapped in {}
+        file_path = event.data
+        if file_path.startswith('{') and file_path.endswith('}'):
+            file_path = file_path[1:-1]
+            
+        ext = os.path.splitext(file_path)[1].lower()
+        img_exts = ['.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp']
+        aud_exts = ['.wav', '.mp3', '.flac', '.ogg', '.aac', '.m4a']
+        
+        if ext in img_exts:
+            self._process_image(file_path)
+        elif ext in aud_exts:
+            self._process_audio(file_path)
+        else:
+            messagebox.showwarning("Unsupported File", f"Cannot load file type: {ext}")
+
+
+    # ──────────────────────────────────────────────────────
     #  UI construction
     # ──────────────────────────────────────────────────────
 
@@ -309,8 +331,10 @@ class KdenLoquist:
         tb.pack(fill=tk.X); tb.pack_propagate(False)
         tk.Label(tb, text="  🎭  KdenLoquist Puppet", bg=ACCENT2, fg=FG,
                  font=("Segoe UI", 12, "bold")).pack(side=tk.LEFT, padx=6)
-        tk.Label(tb, text="Audio-Synced Talking Tool  •  for Kdenlive",
-                 bg=ACCENT2, fg="#ccc", font=("Segoe UI", 9)).pack(side=tk.LEFT)
+        
+        dnd_text = "Drag & Drop Supported!" if DND_SUPPORTED else "Install tkinterdnd2 for Drag & Drop"
+        tk.Label(tb, text=f"Audio-Synced Talking Tool  •  {dnd_text}",
+                 bg=ACCENT2, fg="#e8e8f0" if DND_SUPPORTED else "#ffcc00", font=("Segoe UI", 9)).pack(side=tk.LEFT)
 
     def _build_left_panel(self, parent):
         self._panel = tk.Frame(parent, bg=PANEL_BG, width=280)
@@ -332,12 +356,15 @@ class KdenLoquist:
 
         # Files
         s = Section(p, "📁  Files"); s.pack(**pad); b = s.body
-        StyledButton(b, "📷  Load Image", command=self._load_image, accent=True).pack(fill=tk.X, pady=2)
+        StyledButton(b, "📷  Load Image", command=self._prompt_load_image, accent=True).pack(fill=tk.X, pady=2)
         self._img_lbl = tk.Label(b, text="No image loaded", bg=PANEL_BG, fg=FG_DIM, font=("Segoe UI", 8), wraplength=220)
         self._img_lbl.pack(anchor=tk.W)
-        StyledButton(b, "🎵  Load Audio", command=self._load_audio, accent=True).pack(fill=tk.X, pady=2)
+        StyledButton(b, "🎵  Load Audio", command=self._prompt_load_audio, accent=True).pack(fill=tk.X, pady=2)
         self._aud_lbl = tk.Label(b, text="No audio loaded", bg=PANEL_BG, fg=FG_DIM, font=("Segoe UI", 8), wraplength=220)
         self._aud_lbl.pack(anchor=tk.W)
+        
+        if DND_SUPPORTED:
+            tk.Label(b, text="(Or drag and drop files here)", bg=PANEL_BG, fg=FG_DIM, font=("Segoe UI", 7, "italic")).pack(pady=2)
 
         # Mouth Mask
         s2 = Section(p, "🖊  Mouth Mask"); s2.pack(**pad); b2 = s2.body
@@ -419,12 +446,14 @@ class KdenLoquist:
         self.root.update_idletasks()
 
     # ──────────────────────────────────────────────────────
-    #  File loading
+    #  File loading logic (Refactored for Drag & Drop)
     # ──────────────────────────────────────────────────────
 
-    def _load_image(self):
+    def _prompt_load_image(self):
         path = filedialog.askopenfilename(title="Select Image", filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.tiff *.webp"), ("All", "*.*")])
-        if not path: return
+        if path: self._process_image(path)
+
+    def _process_image(self, path):
         try:
             self.image      = Image.open(path).convert("RGBA")
             self.image_path = path
@@ -440,12 +469,14 @@ class KdenLoquist:
         except Exception as ex:
             messagebox.showerror("Image Error", str(ex))
 
-    def _load_audio(self):
+    def _prompt_load_audio(self):
         path = filedialog.askopenfilename(title="Select Audio", filetypes=[("Audio", "*.wav *.mp3 *.flac *.ogg *.aac *.m4a"), ("All", "*.*")])
-        if not path: return
+        if path: self._process_audio(path)
+
+    def _process_audio(self, path):
         self._status("Loading audio…")
         try:
-            data, sr = load_audio(path)
+            data, sr = load_audio_file(path)
             self.audio_data     = data
             self.sample_rate    = sr
             self.audio_path     = path
@@ -753,15 +784,21 @@ class KdenLoquist:
 
 
 # ══════════════════════════════════════════════════════════
-#  Entry point
+#  Entry point with Graceful Fallback
 # ══════════════════════════════════════════════════════════
 
 def main():
-    root = tk.Tk()
+    if DND_SUPPORTED:
+        root = TkinterDnD.Tk()
+    else:
+        root = tk.Tk()
+        print("Note: Install 'tkinterdnd2' via pip to enable Drag & Drop support.")
+
     try:
         root.tk.call("tk", "scaling", 1.25)
     except Exception:
         pass
+    
     KdenLoquist(root)
     root.mainloop()
 
