@@ -3,7 +3,7 @@
 ============================================================
   KdenLoquist - Audio-Synced Puppet Tool for Kdenlive
   True "Cardboard Cutout" Mode (No Blur, Exact Masking)
-  Drag-and-Drop Supported
+  Drag-and-Drop Supported | Scroll-to-Zoom | MMB Pan
 ============================================================
 """
 
@@ -43,8 +43,12 @@ BTN_HOV  = "#2a2a42"
 RED      = "#ff4f6a"
 YELLOW   = "#f5c542"
 
-SNAP_DIST   = 14   
-POINT_R     = 5    
+SNAP_DIST   = 14
+POINT_R     = 5
+
+ZOOM_MIN    = 0.05
+ZOOM_MAX    = 20.0
+ZOOM_FACTOR = 1.12   # per scroll tick
 
 
 # ══════════════════════════════════════════════════════════
@@ -75,7 +79,7 @@ class LabeledSlider(tk.Frame):
         self.val_lbl = tk.Label(top, text=fmt.format(var.get()),
                                 bg=PANEL_BG, fg=ACCENT, font=("Segoe UI", 8, "bold"))
         self.val_lbl.pack(side=tk.RIGHT)
-        
+
         tk.Scale(self, variable=var, from_=from_, to=to,
                  orient=tk.HORIZONTAL, showvalue=False,
                  bg=PANEL_BG, fg=ACCENT, troughcolor=BTN_BG,
@@ -129,8 +133,8 @@ def load_audio_file(path: str):
     return data, int(sr)
 
 
-def bandpass_rms_envelope(audio, sr, fps, f_low, f_high, smoothing, offset_frames, anim_amount, 
-                          power=1.2, threshold=0.05): 
+def bandpass_rms_envelope(audio, sr, fps, f_low, f_high, smoothing, offset_frames, anim_amount,
+                          power=1.2, threshold=0.05):
     nyq   = sr / 2.0
     f_low = max(20.0, min(f_low, nyq * 0.95))
     f_high= max(f_low + 10, min(f_high, nyq * 0.99))
@@ -145,19 +149,19 @@ def bandpass_rms_envelope(audio, sr, fps, f_low, f_high, smoothing, offset_frame
         s = int(af * spf); e = int(s + spf)
         chunk = filt[s:min(e, len(filt))]
         if len(chunk): env[i] = np.sqrt(np.mean(chunk ** 2))
-    
+
     mx = env.max()
     if mx > 0: env /= mx
-    
+
     env = np.where(env < threshold, 0, (env - threshold) / (1.0 - threshold + 1e-6))
     env = np.clip(env, 0, 1)
     env = np.power(env, power)
-    
+
     if smoothing > 0:
         env = gaussian_filter1d(env, sigma=smoothing * 8.0)
         mx2 = env.max()
         if mx2 > 0: env /= mx2
-        
+
     return env * anim_amount
 
 
@@ -184,8 +188,7 @@ def render_frame_puppet(base_rgba: np.ndarray, points: list,
         return result
 
     h_img, w_img = result.shape[:2]
-    
-    # Get bounding box of the drawn polygon to calculate the drop relative to its height
+
     pts_np = np.array(points, dtype=np.int32)
     y1 = pts_np[:, 1].min()
     y2 = pts_np[:, 1].max()
@@ -199,29 +202,25 @@ def render_frame_puppet(base_rgba: np.ndarray, points: list,
     ir, ig, ib = inner_color
     full_mask  = _poly_mask(points, h_img, w_img)
 
-    # 1. Fill the original polygon area with the dark inner mouth color
     inner_arr = np.empty_like(base_rgba)
     inner_arr[:,:] = [ir, ig, ib, 255]
     m_f = full_mask[:, :, np.newaxis].astype(np.float32) / 255.0
-    
-    result = (base_rgba.astype(np.float32) * (1.0 - m_f) + 
+
+    result = (base_rgba.astype(np.float32) * (1.0 - m_f) +
               inner_arr.astype(np.float32) * m_f).astype(np.uint8)
 
-    # 2. Extract the jaw pixels (the exact pixels inside the drawn mask)
     jaw_pixels = base_rgba.copy()
 
-    # 3. Shift both the mask and the jaw pixels downward
     if drop < h_img:
         shifted_mask = np.zeros_like(full_mask)
         shifted_mask[drop:, :] = full_mask[:h_img - drop, :]
-        
+
         shifted_jaw = np.zeros_like(base_rgba)
         shifted_jaw[drop:, :] = jaw_pixels[:h_img - drop, :]
-        
+
         m_s = shifted_mask[:, :, np.newaxis].astype(np.float32) / 255.0
-        
-        # 4. Paste the shifted jaw OVER the result (overlapping whatever is below it)
-        result = (result.astype(np.float32) * (1.0 - m_s) + 
+
+        result = (result.astype(np.float32) * (1.0 - m_s) +
                   shifted_jaw.astype(np.float32) * m_s).astype(np.uint8)
 
     result[:, :, 3] = base_rgba[:, :, 3]
@@ -266,11 +265,17 @@ class KdenLoquist:
         self._hover_cpos  = None
         self._skip_next_click = False
 
+        # ── Zoom / Pan state ──────────────────────────────
+        self._zoom_level  = 1.0   # multiplier on top of fit-to-canvas base scale
+        self._pan_x       = 0.0   # canvas-pixel offset from centered position
+        self._pan_y       = 0.0
+        self._pan_last    = None  # (cx, cy) of last MMB drag position
+
         self._export_thread = None
         self._cancel_export = False
-        
+
         self.v_anim      = tk.DoubleVar(value=0.65)
-        self.v_smooth    = tk.DoubleVar(value=0.15) 
+        self.v_smooth    = tk.DoubleVar(value=0.15)
         self.v_jaw_drop  = tk.DoubleVar(value=0.55)
         self.v_power     = tk.DoubleVar(value=1.5)
         self.v_threshold = tk.DoubleVar(value=0.05)
@@ -279,7 +284,7 @@ class KdenLoquist:
         self.v_offset    = tk.IntVar(value=0)
         self.v_fps       = tk.IntVar(value=24)
         self.v_crf       = tk.IntVar(value=20)
-        self.v_mouth_color = tk.StringVar(value="#1a0008")
+        self.v_mouth_color = tk.StringVar(value="#000000")   # ← changed default
 
         self._build_ui()
 
@@ -287,18 +292,18 @@ class KdenLoquist:
         self.root.bind("<Z>", lambda e: self._undo_point())
 
     # ──────────────────────────────────────────────────────
-    #  Drag and Drop logic
+    #  Drag and Drop
     # ──────────────────────────────────────────────────────
-    
+
     def _on_file_drop(self, event):
         file_path = event.data
         if file_path.startswith('{') and file_path.endswith('}'):
             file_path = file_path[1:-1]
-            
+
         ext = os.path.splitext(file_path)[1].lower()
         img_exts = ['.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp']
         aud_exts = ['.wav', '.mp3', '.flac', '.ogg', '.aac', '.m4a']
-        
+
         if ext in img_exts:
             self._process_image(file_path)
         elif ext in aud_exts:
@@ -323,7 +328,7 @@ class KdenLoquist:
         tb.pack(fill=tk.X); tb.pack_propagate(False)
         tk.Label(tb, text="  🎭  KdenLoquist Cutout", bg=ACCENT2, fg=FG,
                  font=("Segoe UI", 12, "bold")).pack(side=tk.LEFT, padx=6)
-        
+
         dnd_text = "Drag & Drop Supported!" if DND_SUPPORTED else "Install tkinterdnd2 for Drag & Drop"
         tk.Label(tb, text=f"Audio-Synced Talking Tool  •  {dnd_text}",
                  bg=ACCENT2, fg="#e8e8f0" if DND_SUPPORTED else "#ffcc00", font=("Segoe UI", 9)).pack(side=tk.LEFT)
@@ -354,7 +359,7 @@ class KdenLoquist:
         StyledButton(b, "🎵  Load Audio", command=self._prompt_load_audio, accent=True).pack(fill=tk.X, pady=2)
         self._aud_lbl = tk.Label(b, text="No audio loaded", bg=PANEL_BG, fg=FG_DIM, font=("Segoe UI", 8), wraplength=220)
         self._aud_lbl.pack(anchor=tk.W)
-        
+
         if DND_SUPPORTED:
             tk.Label(b, text="(Or drag and drop files here)", bg=PANEL_BG, fg=FG_DIM, font=("Segoe UI", 7, "italic")).pack(pady=2)
 
@@ -373,7 +378,7 @@ class KdenLoquist:
         s3 = Section(p, "🎬  Puppet Physics"); s3.pack(**pad); b3 = s3.body
         LabeledSlider(b3, "Animation Amount", self.v_anim,  0.05, 1.5).pack(fill=tk.X, pady=2)
         LabeledSlider(b3, "Jaw Drop (Cutout Width)", self.v_jaw_drop, 0.1, 1.0).pack(fill=tk.X, pady=2)
-        
+
         tk.Label(b3, text="- Dynamics -", bg=PANEL_BG, fg=FG_DIM, font=("Segoe UI", 8, "italic")).pack(pady=2)
         LabeledSlider(b3, "Response (Snappiness)", self.v_power, 0.5, 3.0, fmt="{:.2f}").pack(fill=tk.X, pady=2)
         LabeledSlider(b3, "Silence Cutoff (Gate)", self.v_threshold, 0.0, 0.3, fmt="{:.3f}").pack(fill=tk.X, pady=2)
@@ -402,6 +407,7 @@ class KdenLoquist:
         # Actions
         s5 = Section(p, "▶  Actions"); s5.pack(**pad); b5 = s5.body
         StyledButton(b5, "👁  Preview Frame",  command=self._preview_frame).pack(fill=tk.X, pady=2)
+        StyledButton(b5, "🔍  Reset Zoom",     command=self._reset_zoom).pack(fill=tk.X, pady=2)
         self._export_btn = StyledButton(b5, "🎬  Export Video", command=self._start_export, accent=True)
         self._export_btn.pack(fill=tk.X, pady=2)
         self._cancel_btn = StyledButton(b5, "✖  Cancel", command=self._cancel, danger=True)
@@ -415,20 +421,36 @@ class KdenLoquist:
     def _build_canvas(self, parent):
         frame = tk.Frame(parent, bg=BG)
         frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=2, pady=2)
-        tk.Label(frame, text="← Load an image, then trace ONLY the piece that will drop (e.g. the chin).", bg=BG, fg=FG_DIM, font=("Segoe UI", 9)).pack(anchor=tk.W, padx=6, pady=(4, 0))
-        self._canvas = tk.Canvas(frame, bg="#090912", highlightthickness=1, highlightbackground=ACCENT2, cursor="crosshair")
+        tk.Label(frame,
+                 text="← Load an image, then trace ONLY the piece that will drop (e.g. the chin).  "
+                      "  Scroll = Zoom  •  Middle-drag = Pan  •  Double-click = Close mask",
+                 bg=BG, fg=FG_DIM, font=("Segoe UI", 9)).pack(anchor=tk.W, padx=6, pady=(4, 0))
+        self._canvas = tk.Canvas(frame, bg="#090912", highlightthickness=1,
+                                 highlightbackground=ACCENT2, cursor="crosshair")
         self._canvas.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
+        # Drawing events
         self._canvas.bind("<Button-1>",        self._on_click)
         self._canvas.bind("<Double-Button-1>", self._on_double_click)
         self._canvas.bind("<Button-3>",        self._on_right_click)
         self._canvas.bind("<Motion>",          self._on_mouse_move)
         self._canvas.bind("<Configure>",       self._on_canvas_resize)
 
+        # Zoom (Windows/macOS <MouseWheel>, Linux <Button-4/5>)
+        self._canvas.bind("<MouseWheel>",      self._on_scroll)
+        self._canvas.bind("<Button-4>",        self._on_scroll)   # Linux scroll up
+        self._canvas.bind("<Button-5>",        self._on_scroll)   # Linux scroll down
+
+        # Pan with middle mouse button
+        self._canvas.bind("<Button-2>",        self._on_pan_start)
+        self._canvas.bind("<B2-Motion>",       self._on_pan_drag)
+        self._canvas.bind("<ButtonRelease-2>", self._on_pan_end)
+
         self._canvas.after(200, self._draw_placeholder)
 
     def _build_statusbar(self):
-        self._statusbar = tk.Label(self.root, text="Ready", bg=ACCENT2, fg=BG, font=("Segoe UI", 8), anchor=tk.W, padx=8, pady=3)
+        self._statusbar = tk.Label(self.root, text="Ready", bg=ACCENT2, fg=BG,
+                                   font=("Segoe UI", 8), anchor=tk.W, padx=8, pady=3)
         self._statusbar.pack(fill=tk.X, side=tk.BOTTOM)
 
     def _status(self, msg, color=None):
@@ -436,11 +458,79 @@ class KdenLoquist:
         self.root.update_idletasks()
 
     # ──────────────────────────────────────────────────────
-    #  File loading logic (Refactored for Drag & Drop)
+    #  Zoom & Pan
+    # ──────────────────────────────────────────────────────
+
+    def _on_scroll(self, e):
+        """Zoom centered on the cursor position."""
+        if self.image is None:
+            return
+
+        # Determine scroll direction across platforms
+        if e.num == 4 or (hasattr(e, 'delta') and e.delta > 0):
+            factor = ZOOM_FACTOR
+        else:
+            factor = 1.0 / ZOOM_FACTOR
+
+        new_zoom = max(ZOOM_MIN, min(ZOOM_MAX, self._zoom_level * factor))
+        if new_zoom == self._zoom_level:
+            return
+
+        # Image coords under the cursor before zoom
+        ix = (e.x - self._disp_off_x) / self._disp_scale
+        iy = (e.y - self._disp_off_y) / self._disp_scale
+
+        self._zoom_level = new_zoom
+
+        # Recompute base scale (fit-to-canvas) and new actual scale
+        cw = self._canvas.winfo_width()
+        ch = self._canvas.winfo_height()
+        iw, ih = self.image.size
+        base_scale  = min(cw / iw, ch / ih)
+        new_scale   = base_scale * self._zoom_level
+        dw_new = int(iw * new_scale)
+        dh_new = int(ih * new_scale)
+
+        # Adjust pan so the pixel under the cursor stays fixed
+        self._pan_x = e.x - ix * new_scale - (cw - dw_new) // 2
+        self._pan_y = e.y - iy * new_scale - (ch - dh_new) // 2
+
+        self._refresh_canvas()
+        pct = int(self._zoom_level * 100)
+        self._status(f"Zoom: {pct}%  (scroll to zoom, MMB-drag to pan)")
+
+    def _on_pan_start(self, e):
+        self._pan_last = (e.x, e.y)
+        self._canvas.config(cursor="fleur")
+
+    def _on_pan_drag(self, e):
+        if self._pan_last is None or self.image is None:
+            return
+        dx = e.x - self._pan_last[0]
+        dy = e.y - self._pan_last[1]
+        self._pan_x += dx
+        self._pan_y += dy
+        self._pan_last = (e.x, e.y)
+        self._refresh_canvas()
+
+    def _on_pan_end(self, e):
+        self._pan_last = None
+        self._canvas.config(cursor="crosshair")
+
+    def _reset_zoom(self):
+        self._zoom_level = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self._refresh_canvas()
+        self._status("Zoom reset to fit.")
+
+    # ──────────────────────────────────────────────────────
+    #  File loading
     # ──────────────────────────────────────────────────────
 
     def _prompt_load_image(self):
-        path = filedialog.askopenfilename(title="Select Image", filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.tiff *.webp"), ("All", "*.*")])
+        path = filedialog.askopenfilename(title="Select Image",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.tiff *.webp"), ("All", "*.*")])
         if path: self._process_image(path)
 
     def _process_image(self, path):
@@ -450,6 +540,9 @@ class KdenLoquist:
             self.base_rgba  = np.array(self.image, dtype=np.uint8)
             self.mask_points = []
             self.mask_closed = False
+            self._zoom_level = 1.0          # reset zoom on new image
+            self._pan_x = 0.0
+            self._pan_y = 0.0
             short = os.path.basename(path)
             w, h  = self.image.size
             self._img_lbl.config(text=f"{short}\n{w}×{h} px", fg=ACCENT)
@@ -460,7 +553,8 @@ class KdenLoquist:
             messagebox.showerror("Image Error", str(ex))
 
     def _prompt_load_audio(self):
-        path = filedialog.askopenfilename(title="Select Audio", filetypes=[("Audio", "*.wav *.mp3 *.flac *.ogg *.aac *.m4a"), ("All", "*.*")])
+        path = filedialog.askopenfilename(title="Select Audio",
+            filetypes=[("Audio", "*.wav *.mp3 *.flac *.ogg *.aac *.m4a"), ("All", "*.*")])
         if path: self._process_audio(path)
 
     def _process_audio(self, path):
@@ -490,10 +584,12 @@ class KdenLoquist:
     # ──────────────────────────────────────────────────────
 
     def _img_to_canvas(self, ix, iy):
-        return (ix * self._disp_scale + self._disp_off_x, iy * self._disp_scale + self._disp_off_y)
+        return (ix * self._disp_scale + self._disp_off_x,
+                iy * self._disp_scale + self._disp_off_y)
 
     def _canvas_to_img(self, cx, cy):
-        return ((cx - self._disp_off_x) / self._disp_scale, (cy - self._disp_off_y) / self._disp_scale)
+        return ((cx - self._disp_off_x) / self._disp_scale,
+                (cy - self._disp_off_y) / self._disp_scale)
 
     def _canvas_dist_to_first_point(self, cx, cy):
         if not self.mask_points: return float("inf")
@@ -584,7 +680,9 @@ class KdenLoquist:
             cw = self._canvas.winfo_width()
             ch = self._canvas.winfo_height()
             self._canvas.delete("all")
-            self._canvas.create_text(cw // 2, ch // 2, text="Load an image to begin", fill=FG_DIM, font=("Segoe UI", 16))
+            self._canvas.create_text(cw // 2, ch // 2,
+                text="Load an image to begin\n\nScroll to zoom  •  Middle-drag to pan",
+                fill=FG_DIM, font=("Segoe UI", 16), justify=tk.CENTER)
 
     def _refresh_canvas(self, overlay=None):
         if self.image is None: return
@@ -592,15 +690,26 @@ class KdenLoquist:
         ch = max(self._canvas.winfo_height(), 100)
         src = Image.fromarray(overlay) if overlay is not None else self.image
         iw, ih = src.size
-        scale  = min(cw / iw, ch / ih, 1.0)
-        dw, dh = int(iw * scale), int(ih * scale)
-        self._disp_scale = scale
-        self._disp_off_x = (cw - dw) // 2
-        self._disp_off_y = (ch - dh) // 2
-        self._tk_image   = ImageTk.PhotoImage(src.resize((dw, dh), Image.LANCZOS))
+
+        # Base scale = fit-to-canvas; actual scale adds zoom on top
+        base_scale   = min(cw / iw, ch / ih)
+        actual_scale = base_scale * self._zoom_level
+        dw = int(iw * actual_scale)
+        dh = int(ih * actual_scale)
+
+        # Centered position + pan offset
+        off_x = (cw - dw) // 2 + int(self._pan_x)
+        off_y = (ch - dh) // 2 + int(self._pan_y)
+
+        self._disp_scale = actual_scale
+        self._disp_off_x = off_x
+        self._disp_off_y = off_y
+
+        resized = src.resize((max(dw, 1), max(dh, 1)), Image.LANCZOS)
+        self._tk_image = ImageTk.PhotoImage(resized)
 
         self._canvas.delete("all")
-        self._canvas.create_image(self._disp_off_x, self._disp_off_y, anchor=tk.NW, image=self._tk_image)
+        self._canvas.create_image(off_x, off_y, anchor=tk.NW, image=self._tk_image)
         self._draw_polygon_overlay()
         self._rubber_id = None
         self._draw_rubber_band()
@@ -616,24 +725,29 @@ class KdenLoquist:
 
         for i, (cx, cy) in enumerate(cpts):
             is_first = (i == 0)
-            fill  = YELLOW if is_first else ACCENT
-            r     = POINT_R + 2 if is_first else POINT_R
-            outline = FG if is_first else ACCENT2
-            self._canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill=fill, outline=outline, width=1)
+            fill     = YELLOW if is_first else ACCENT
+            r        = POINT_R + 2 if is_first else POINT_R
+            outline  = FG if is_first else ACCENT2
+            self._canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                     fill=fill, outline=outline, width=1)
 
     def _draw_rubber_band(self):
         if self._rubber_id:
             self._canvas.delete(self._rubber_id)
             self._rubber_id = None
-        if (self.mask_closed or not self.mask_points or self._hover_cpos is None or self.image is None): return
+        if (self.mask_closed or not self.mask_points or
+                self._hover_cpos is None or self.image is None):
+            return
         last_cx, last_cy = self._img_to_canvas(*self.mask_points[-1])
         hx, hy = self._hover_cpos
-        near_close = (len(self.mask_points) >= 3 and self._canvas_dist_to_first_point(hx, hy) <= SNAP_DIST)
+        near_close = (len(self.mask_points) >= 3 and
+                      self._canvas_dist_to_first_point(hx, hy) <= SNAP_DIST)
         colour = YELLOW if near_close else FG_DIM
-        self._rubber_id = self._canvas.create_line(last_cx, last_cy, hx, hy, fill=colour, dash=(4, 4), width=1)
+        self._rubber_id = self._canvas.create_line(last_cx, last_cy, hx, hy,
+                                                   fill=colour, dash=(4, 4), width=1)
 
     # ──────────────────────────────────────────────────────
-    #  Rendering & Preview helpers
+    #  Rendering & Preview
     # ──────────────────────────────────────────────────────
 
     def _hex_to_rgb(self, h):
@@ -695,7 +809,7 @@ class KdenLoquist:
             n_frames = int(np.ceil(self.audio_duration * fps))
 
             self._ui(lambda: self._prog_lbl.config(text="Analysing audio…", fg=FG_DIM))
-            
+
             env = bandpass_rms_envelope(
                 self.audio_data, self.sample_rate, fps,
                 self.v_flo.get(), self.v_fhi.get(),
@@ -760,7 +874,7 @@ class KdenLoquist:
 
 
 # ══════════════════════════════════════════════════════════
-#  Entry point with Graceful Fallback
+#  Entry point
 # ══════════════════════════════════════════════════════════
 
 def main():
@@ -774,7 +888,7 @@ def main():
         root.tk.call("tk", "scaling", 1.25)
     except Exception:
         pass
-    
+
     KdenLoquist(root)
     root.mainloop()
 
